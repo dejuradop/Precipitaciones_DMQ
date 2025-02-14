@@ -35,9 +35,9 @@ prec<- prec %>%
 prec$Fecha <- as.Date(prec$Fecha, format = "%Y-%m-%d") # Convertir la columna Fecha
 
 #########################################################################################
-est<- st_read("D:/COE/Meteorologia/EstacioneEPMAPS/Estacionesfinal.shp")
+est<- st_read("D:\COE\Productos Geografo\2024\Reportes situacion climatica\Precipitaciones\LluviaDMQ\data\Estacionesfinal.gpkg")
 
-DMQ <- st_read("D:/COE/Productos Geografo/2024/Escenarios/Coberturas_escenario/AZ_ORD002_2024.shp")
+DMQ <- st_read("D:\COE\Productos Geografo\2024\Reportes situacion climatica\Precipitaciones\LluviaDMQ\data\AZ_ORD002_2024.gpkg")
 
 #####################################################################################################
 datos_filtrados <- reactive({
