@@ -25,7 +25,7 @@ library(raster)
 library(xts)
 library(dygraphs)
 
-prec <- read.csv("D:/COE/Meteorologia/Base.csv")
+prec <- read.csv("data/Base.csv")
 prec<- prec %>% 
   dplyr::select(Fecha,Belisario,Carapungo,Centro, Cotocollao,Guamani,SanAntonio,LosChillos,Tumbaco,CalderonP20,BellavistaC05,#RumipambaC04,
                 YaruquiC06,SalvefachaC13,PuengasiC18,EltrojeC19,Paluguillo,Santa.Rosa,El.Cinto,Solanda,El.Tingo,San.Francisco,Colinas.Alto,El.CarmenP54,
@@ -35,9 +35,9 @@ prec<- prec %>%
 prec$Fecha <- as.Date(prec$Fecha, format = "%Y-%m-%d") # Convertir la columna Fecha
 
 #########################################################################################
-est<- st_read("D:\COE\Productos Geografo\2024\Reportes situacion climatica\Precipitaciones\LluviaDMQ\data\Estacionesfinal.gpkg")
+est<- st_read("data\Estacionesfinal.gpkg")
 
-DMQ <- st_read("D:\COE\Productos Geografo\2024\Reportes situacion climatica\Precipitaciones\LluviaDMQ\data\AZ_ORD002_2024.gpkg")
+DMQ <- st_read("data\AZ_ORD002_2024.gpkg")
 
 #####################################################################################################
 datos_filtrados <- reactive({
