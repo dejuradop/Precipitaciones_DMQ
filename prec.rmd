@@ -19,10 +19,13 @@ library(plotly)
 library(leaflet)
 library(tidyverse)
 library(sf)
-
+library(lubridate)
+library(sp)
 library(raster)
-
+library(gstat)
 library(xts)
+# Cargar la librería classInt para la reclasificación
+library(classInt)
 library(dygraphs)
 
 prec <- read.csv("data/Base.csv")
@@ -35,9 +38,9 @@ prec<- prec %>%
 prec$Fecha <- as.Date(prec$Fecha, format = "%Y-%m-%d") # Convertir la columna Fecha
 
 #########################################################################################
-est<- st_read("data\Estacionesfinal.gpkg")
+est<- st_read("data/Estacionesfinal.shp")
 
-DMQ <- st_read("data\AZ_ORD002_2024.gpkg")
+DMQ <- st_read("data/AZ_ORD002_2024.shp")
 
 #####################################################################################################
 datos_filtrados <- reactive({
@@ -47,8 +50,6 @@ datos_filtrados <- reactive({
       rename(Lluvia = input$estacion)  # Renombrar la columna seleccionada a 'Lluvia'
   })
 ###########################################################################################################
-
-
 datos_mensuales <- reactive({
   req(input$estacion, input$anio)  # Asegura que haya valores seleccionados
 
@@ -63,7 +64,6 @@ datos_mensuales <- reactive({
     ungroup()
 
 ###################################################################
-  
   
 acumulado_mensual_historico <- prec %>%
   group_by(Anio, Mes) %>%
@@ -80,7 +80,6 @@ promedio_mensual_historico <- acumulado_mensual_historico %>%
   datos_mensuales <-  datos_anio%>%
   left_join(promedio_mensual_historico, by = "Mes")
 })
-
 
 
 ##############################################################################
@@ -116,84 +115,80 @@ anomalia <- acumulado%>%
 
 })
 ################################################################################
-#Anomalias MAPA
+data_filtrada <- reactive({
+    req(input$fechas)
+    prec %>%
+      filter(Fecha >= input$fecha[1] & Fecha <= input$fecha[2]) %>%
+      summarise(across(-Fecha, mean, na.rm = TRUE)) %>%
+      pivot_longer(cols = everything(), names_to = "Estacion", values_to = "Precipitacion") %>%
+      left_join(coords, by = "Estacion")
+  })
 
-mapa_anomalia <-  reactive({
-# 4. Inicializar el dataframe final
-resultado <- data.frame(
-  NOMBRE = character(),
-  Lluvias_Acumuladas_Dic_2024 = numeric(),
-  Promedio_Historico_Diciembre = numeric(),
-  Anomalia = numeric(),
-  stringsAsFactors = FALSE
-)
+####################################################################################
 
-# 5. Crear un bucle para cada estación
-estaciones <- names(prec)[!names(prec) %in% c("Fecha", "Mes", "Anio")] # Excluir columnas no relacionadas a estaciones
+  # Reactividad para generar los datos del mapa
+  datos_mapa <- reactive({
+    req(input$fechas)
+    # Filtrar por fecha y estación
+    prec_long <- prec %>% 
+      gather(key = "NOMBRE", value = "Precipitacion", -Fecha, -Mes, -Anio)
 
-for (estacion in estaciones) {
-  # Filtrar datos de diciembre
-  data_diciembre <- prec %>%
-    filter(Mes == month(input$fechas[1])) %>%
-    dplyr::select(Anio, Mes, all_of(estacion))
-  
-  # Lluvias acumuladas de diciembre 2024
-  acumulado_2024 <- data_diciembre %>%
-    filter(Anio == year(input$fechas[1])) %>%
-    summarise(Acumulado = sum(.data[[estacion]], na.rm = TRUE)) %>%
-    pull(Acumulado)
-  
-  # Promedio histórico para diciembre, excluyendo años con 0 o NA
-  promedio_historico <- data_diciembre %>%
-    group_by(Anio) %>%
-    summarise(Suma_Mensual = sum(.data[[estacion]], na.rm = TRUE)) %>%
-    filter(Suma_Mensual > 0) %>% # Excluir los años con cero o NA
-    summarise(Promedio = mean(Suma_Mensual, na.rm = TRUE)) %>%
-    pull(Promedio)
-  
-  # Calcular anomalía
-  anomalia <- acumulado_2024 - promedio_historico
-  
-  # Agregar al dataframe final
-  resultado <- rbind(
-    resultado,
-    data.frame(
-      NOMBRE = estacion,
-      Lluvias_Acumuladas_Dic_2024 = acumulado_2024,
-      Promedio_Historico_Diciembre = promedio_historico,
-      Anomalia = anomalia
+    # Promediar la precipitación por estación en el rango de fechas
+    prec_sum <- prec_long %>%
+      filter(Fecha >= input$fechas[1] & Fecha <= input$fechas[2]) %>%
+      group_by(NOMBRE) %>%
+      summarise(PrecipitacionTotal = sum(Precipitacion, na.rm = TRUE))
+
+    # Convertir el objeto est a dataframe
+    estdf <- as.data.frame(est)
+
+    # Unir los datos de precipitación con las estaciones
+    Datos_p <- merge(x = prec_sum, y = estdf, by = "NOMBRE")
+
+    # Crear un grid para la interpolación
+    ext <- extent(DMQ)  # Obtener la extensión del DMQ
+    grd <- expand.grid(x = seq(from = ext[1], to = ext[2], by = 100),
+                       y = seq(from = ext[3], to = ext[4], by = 100))
+    coordinates(grd) <- ~x + y
+    gridded(grd) <- TRUE
+    crs(grd) <- crs(DMQ)  # Asignar el CRS del DMQ al grid
+
+    coordinates(Datos_p) <- ~ESTE + NORTE
+    crs(Datos_p) <- crs(DMQ)
+    idw.p <- gstat::idw(PrecipitacionTotal ~ 1, Datos_p, grd, idp = 2.5, debug.level = 0)
+    idw.p <- raster(idw.p)
+    idw.p <- raster::mask(idw.p, DMQ)
+    
+    # Obtener los valores del raster
+    valores <- values(idw.p)
+    valores <- valores[!is.na(valores)]
+    
+    # Crear intervalos de clase usando cuantiles (5 partes iguales)
+    intervalos <- classIntervals(valores, n = 5, style = "quantile")
+    idw_reclasificado <- cut(idw.p, breaks = intervalos$brks, include.lowest = TRUE)
+    
+    # Convertir el raster reclasificado a un factor para visualización
+    idw_reclasificado <- ratify(idw_reclasificado)
+    
+    # Definir una paleta de colores para la visualización
+    pal_reclasificado <- colorFactor(
+      palette = c("#FEFFD9", "#DDF2B2", "#74C9BC", "#41B7C4", "#7C4D79"),
+      domain = values(idw_reclasificado),
+      na.color = "transparent"
     )
-  )
-}
+    
+    # Crear etiquetas personalizadas para la leyenda
+    etiquetas <- paste0(
+      "[", round(intervalos$brks[-length(intervalos$brks)], 2), 
+      " - ", round(intervalos$brks[-1], 2), ")"
+    )
+    
+    # Convertir Datos_p a sf y transformarlo a EPSG:4326 (latitud y longitud)
+    datos_sf <- st_as_sf(Datos_p)
+    datos_sf <- st_transform(datos_sf, crs = 4326)
 
-
-est<- st_read("D:/COE/Meteorologia/EstacioneEPMAPS/Estacionesfinal.shp")
-plot(est)
-DMQ <- st_read("D:/COE/Productos Geografo/2024/Escenarios/Coberturas_escenario/AZ_ORD002_2024.shp")
-
-estdf<- as.data.frame(est)
-
-Datos_p<- merge(x = resultado, y =estdf, by = "NOMBRE")
-
-
-ext <- extent(DMQ)
-grd <- expand.grid(x= seq(from = ext[1], to = ext[2], by=30), 
-                   y= seq(from = ext[3], to = ext[4], by=30))
-coordinates(grd) <- ~x + y
-gridded(grd)<- TRUE 
-crs(grd) <- crs(DMQ)
-
-coordinates(Datos_p)<- ~ESTE + NORTE
-crs(Datos_p) <- crs(DMQ)
-idw.p <- gstat::idw(Anomalia ~1, Datos_p, grd, idp=3.5,debug.level = 0)
-idw.p <- raster(idw.p)
-idw.p <- raster::mask(idw.p,DMQ)
-
-idw.p <- raster::projectRaster(idw.p, crs = "+proj=longlat +datum=WGS84")
-
-return(idw.p)
-
-})
+    return(list(idw_reclasificado = idw_reclasificado, pal_reclasificado = pal_reclasificado, datos_sf = datos_sf, etiquetas = etiquetas))
+  })
 ```
 
 Sidebar {.sidebar}
@@ -237,7 +232,7 @@ renderValueBox({
   
   # Si no hay datos, devolver 0 días secos consecutivos
   if (nrow(datos) == 0) {
-    return(valueBox(0, "Días Secos Consecutivos", icon = "sun", color = "gray"))
+    return(valueBox(0, "Días Secos Consecutivos", icon = "fa-sun", color = "gray"))
   }
   
   # Ordenar los datos por fecha ascendente
@@ -280,7 +275,7 @@ renderValueBox({
   )
   
   # Crear el ValueBox con el último valor de días secos consecutivos
-  valueBox(ultimos_dias_secos, "Días Secos Consecutivos", icon = "sun", color = color)
+  valueBox(ultimos_dias_secos, "Días Secos Consecutivos", icon = "fa-sun", color = color)
 })
 
 
@@ -295,7 +290,7 @@ renderValueBox({
 
   # Si no hay datos, devolver 0 días consecutivos
   if (nrow(datos) == 0) {
-    return(valueBox(0, "Días Consecutivos de Lluvia", icon = "cloud-rain", color = "gray"))
+    return(valueBox(0, "Días Consecutivos de Lluvia", icon = "fa-cloud-rain", color = "gray"))
   }
 
   # Ordenar los datos por fecha ascendente
@@ -338,7 +333,7 @@ renderValueBox({
   )
 
   # Crear el ValueBox con el último valor de días consecutivos
-  valueBox(ultimos_dias_consecutivos, "Días Consecutivos de Lluvia", icon = "cloud-rain", color = color)
+  valueBox(ultimos_dias_consecutivos, "Días Consecutivos de Lluvia", icon = "fa-cloud-rain", color = color)
 })
 
 ```
@@ -358,7 +353,7 @@ renderValueBox({
   max_precipitacion_total <- ifelse(is.finite(max_precipitacion_total), max_precipitacion_total, 0)
 
   # Mostrar el valueBox con el valor máximo registrado de toda la serie para la estación seleccionada
-  valueBox(max_precipitacion_total, "Máximo Registrado (2000-2025)", icon = "fa-tachometer-alt", color = "aqua")
+  valueBox(max_precipitacion_total, "Máximo Diario Registrado (2000-2025)", icon = "fa-tachometer-alt", color = "aqua")
 })
 
 
@@ -387,6 +382,7 @@ renderValueBox({
   # Si no hay datos, establecer la suma como 0
   suma_precipitacion_total <- ifelse(is.finite(suma_precipitacion_total), suma_precipitacion_total, 0)
   
+  
   # Mostrar el valueBox con la suma total de precipitación para la estación seleccionada y el rango de fechas
   valueBox(
     suma_precipitacion_total, 
@@ -396,10 +392,52 @@ renderValueBox({
   )
 })
 
+```
 
+row
+-------------------------------------------------------------------------------
 
+### Dias con Lluvia
+
+```{r}
+
+renderValueBox({
+  # Obtener los datos filtrados
+  datos <- datos_filtrados()
+
+  # Si no hay datos, devolver 0 días y 0 mm de lluvia
+  if (nrow(datos) == 0) {
+    return(valueBox("0 días", "Días con Lluvia", icon = "fa-calendar-days", color = "gray"))
+  }
+
+  # Contar los días con lluvia (Lluvia > 1)
+  total_dias_lluvia <- sum(!is.na(datos$Lluvia) & datos$Lluvia > 1)
+
+  # Calcular la suma total de precipitación
+  suma_precipitacion <- sum(datos$Lluvia, na.rm = TRUE)
+
+  # Obtener el rango de fechas
+  fecha_inicio <- min(datos$Fecha, na.rm = TRUE)
+  fecha_fin <- max(datos$Fecha, na.rm = TRUE)
+
+  # Determinar el color del ValueBox según los días con lluvia
+  color <- case_when(
+    total_dias_lluvia == 0 ~ "#28a745",  # Verde si no ha llovido
+    total_dias_lluvia > 0 & total_dias_lluvia <= 10 ~ "#ffc107",  # Amarillo para pocos días de lluvia
+    total_dias_lluvia > 10 ~ "#dc3545"    # Rojo si ha llovido muchos días
+  )
+
+  # Crear el ValueBox con el total de días con lluvia y la suma total de precipitación
+  valueBox(
+    paste0(total_dias_lluvia, ""), 
+    paste("Dias con lluvia (", format(fecha_inicio, "%Y-%m-%d"), " a ", format(fecha_fin, "%Y-%m-%d"), ") "),
+    icon = "fa-calendar-days", 
+    color = color
+  )
+})
 
 ```
+
 
 row {.tabset .tabset-fade}
 -------------------------------------------------------------------------------
@@ -443,17 +481,17 @@ output$graficoMensual <- renderPlotly({
   
   # Gráfico base con ggplot
   p <- ggplot(datos, aes(x = Mes)) +
-    geom_bar(aes(y = Lluvia), stat = "identity", fill = "blue", alpha = 0.8, width = 0.5) +  # Barras del año seleccionado
-    geom_line(aes(y = Promedio), color = "red", size = 0.6, linetype = "dashed") +  # Línea del promedio histórico
-    geom_point(aes(y = Promedio), color = "red", size = 1.5) +  # Puntos en la línea para mayor claridad
-    scale_x_continuous(breaks = 1:12, labels = meses) +  # Mostrar meses en español
-    labs(title = "Comparación de Lluvia Mensual vs. Promedio Histórico",
-         x = "Mes",
-         y = "Precipitación (mm)") +
-    theme_minimal()
+  geom_col(aes(y = Lluvia), fill = "blue", alpha = 0.8, width = 0.5) +  # Usa geom_col() en lugar de geom_bar()
+  geom_line(aes(y = Promedio), color = "red", size = 0.6, linetype = "dashed") +  
+  geom_point(aes(y = Promedio), color = "red", size = 1.5) +  
+  scale_x_continuous(breaks = 1:12, labels = meses) +  
+  labs(title = "Comparación de Lluvia Mensual vs. Promedio Histórico",
+       x = "Mes",
+       y = "Precipitación (mm)") +
+  theme_minimal()
 
-  # Convertir a plotly sin modificar el estilo base
-  ggplotly(p)
+ggplotly(p)
+
 })
 
 # Salida del gráfico
@@ -464,8 +502,6 @@ plotlyOutput("graficoMensual")
 
 
 ```
-
-### Anual
 
 row 
 -------------------------------------------------------------------------------
@@ -506,34 +542,23 @@ plotlyOutput("graficoAnomalia")
 ```
 
 
-### Mapa Anomalia
+### Mapa Total Acumulado mm
 
 ```{r}
 
-output$mapaAnomalia <- renderLeaflet({
-  # Asegúrate de que mapa_anomalia esté disponible
-  req(mapa_anomalia())  
+# Renderizar el mapa en la interfaz
+  output$mapa <- renderLeaflet({
+    datos <- datos_mapa()
+    
+    leaflet() %>%
+      addTiles() %>%
+      addRasterImage(datos$idw_reclasificado, colors = datos$pal_reclasificado, opacity = 0.7) %>%
+      addCircleMarkers(data = datos$datos_sf, color = "red", radius = 3, 
+                       popup = ~paste("Estación:", NOMBRE, "<br>", "Total mm:", PrecipitacionTotal))
+  })
   
-  # Extraemos idw.p desde el retorno de mapa_anomalia
-  idw.p <- mapa_anomalia()  
-  
-  # Define los límites del mapa para asegurar que se vea correctamente
-  bounds <- extent(idw.p)
-  
-  paleta_color <- colorNumeric(
-  palette = colorRampPalette(c("red", "lightgray", "blue"))(5),
-  domain = values(idw.p), 
-  na.color = "transparent"
-)
-
-leaflet() %>%
-  addTiles() %>%
-  addRasterImage(idw.p, colors = paleta_color, opacity = 0.7) %>%
-  fitBounds(bounds@xmin, bounds@ymin, bounds@xmax, bounds@ymax)
-
-})
-
-leafletOutput("mapaAnomalia")
+# Asegúrate de que leafletOutput("mapa") esté en la UI de tu aplicación Shiny
+leafletOutput("mapa")
 
 ```
 
